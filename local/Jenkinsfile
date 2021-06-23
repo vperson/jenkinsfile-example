@@ -1,0 +1,198 @@
+#!/usr/bin/env groovy
+
+def hookURL = "http://localhost:8080"
+def dockerfileDir = "dockerfile-build"
+/*
+Dockerfile存储在一个独有的git仓库中，通过创建jenkins的job，将git仓库的dockerfile拉取到workspace中以供构建镜像使用
+
+为什么dockerfile不放在业务源代码仓库中?
+    * 减少开发的在意点，让他们不需要关注这块
+    * Dockerfile中的FROM镜像可能会经常性的做修改，如果分散在每个仓库中维护过于复杂
+
+如果使用Kubernetes部署jenkins这个方法是否还有效：
+    * 假如他支持同时克隆两个仓库的情况下是支持的，目前我还没有测试k8s中的jenkins;
+    * k8s中的jenkins如果不支持克隆两个仓库，可以选择把dockerfile存储在URL中，使用的时候拉取下来
+
+ */
+
+
+/*
+全局环境变量说明:
+JAR_FILE : jar包文件名,这个方法比较通用,如果喜欢用读取pom.xml的方式就用：ARTIFACT_ID and JAR_VERSION;使用JAR_FILE就不建议使用这两个变量了
+ARTIFACT_ID : 服务名字
+JAR_VERSION : 生成的jar包的版本
+
+GIT_CRUUENT_BRANCH : git 当前分支
+GIT_COMMIT_ID : 简短git commit id
+GIT_COMMIT_USER : git 提交用户名,如果是中文可能会影响docker镜像的生成
+GIT_COMMIT_MSG : git commit msg
+ */
+pipeline{
+    agent any
+
+    parameters {
+        string(
+            name: 'SERVICE_NAME',
+            defaultValue: 'app-message',
+            description: '服务名',
+            trim: true
+        )
+        string(
+            name: 'APP_TARGET',
+            defaultValue: 'server/target/',
+            description: '服务jar包所在位置',
+            trim: true
+        )
+        choice(
+          description: '构建环境',
+          name: 'DEPLOY_ENV',
+          choices: ['dev', 'rc', 'canary','prod']
+        )
+        string(
+            name: 'GIT_URL',
+            defaultValue: 'ssh://git@xxxx.xxxx.cn:10022/xxxx-base-service/message-center.git',
+            description: 'git地址',
+            trim: true
+        )
+        string(
+            name: 'DEPLOY_BRANCH',
+            defaultValue: 'master',
+            description: '部署的分支',
+            trim: true
+        )
+        credentials(
+            name: 'GIT_TOKEN',
+            description: 'git拉取凭证',
+            defaultValue: 'git',
+            credentialType: "SSH Username with private key",
+            required: true
+        )
+        string(
+            name: 'LATEST_VERSION',
+            defaultValue: 'latest',
+            description: '用于istio的版本控制',
+            trim: true
+        )
+        string(
+            name: 'DOCKERFILE_JOB',
+            defaultValue: 'dockerfile',
+            description: '存储dockerfile的job',
+            trim: true
+        )
+        booleanParam(
+            name: 'IS_DEPLOY',
+            defaultValue: true,
+            description: '是否只打包镜像不部署'
+        )
+    }
+    // 这种方式是和jenkinsfile和源代码在一起的场景,如果jenkinsfile是分开的可以选择把定义的内容放在stage里面
+    // environment {
+    //     //Use Pipeline Utility Steps plugin to read information from pom.xml into env variables
+    //     ARTIFACT_ID = readMavenPom().getArtifactId()
+    //     JAR_VERSION = readMavenPom().getVersion()
+    // }
+    tools {
+        // Manage Jenkins -> Global Tool Configuration -> maven
+        //                                             -> jdk
+        // 这里的名字会随着配置的不同而改变
+        maven 'Maven3.6.3'
+        jdk 'jdk8u261'
+    }
+    stages{
+        stage("clone代码"){
+            steps{
+                git url: "${params.GIT_URL}",
+                    branch: "${params.DEPLOY_BRANCH}",
+                    credentialsId: "${params.GIT_TOKEN}"
+            }
+        }
+        stage("收集项目信息") {
+            steps {
+                script {
+                    env.GIT_COMMIT_MSG = sh(script: "git log --format=format:%s -1", returnStdout:true).trim()
+                    env.GIT_COMMIT_USER = sh(script: "git log --pretty=format:'%cn' -1", returnStdout:true).trim()
+                    env.GIT_COMMIT_ID = sh(script: "git rev-parse --short HEAD", returnStdout:true).trim()
+                    env.GIT_CRUUENT_BRANCH = sh(script: "echo ${params.DEPLOY_BRANCH}|awk -F'/' '{print \$NF}'", returnStdout:true).trim()
+                }
+                echo "存储dockerfile的路径: ${dockerfileDir}"
+                echo "${GIT_COMMIT_MSG}"
+                echo "${GIT_COMMIT_USER}"
+                echo "${GIT_COMMIT_ID}"
+                echo "${GIT_CRUUENT_BRANCH}"
+            }
+        }
+        stage("编译"){
+            steps {
+                // script {
+                // 生成的jar包非常的不规范,这个方法用不了
+                //     //Use Pipeline Utility Steps plugin to read information from pom.xml into env variables
+                //     env.ARTIFACT_ID = readMavenPom().getArtifactId()
+                //     env.JAR_VERSION = readMavenPom().getVersion()
+                // }
+                sh 'mvn clean package -DskipTests -U'
+                script {
+                    env.JAR_FILE = sh(script: "ls ${params.APP_TARGET} |egrep '.*jar\$'", returnStdout:true).trim()
+                }
+            }
+        }
+        stage("git信息") {
+            steps {
+                echo "分支 : ${GIT_CRUUENT_BRANCH}"
+                echo "CommitID : ${GIT_COMMIT_ID}"
+                echo "用户 : ${GIT_COMMIT_USER}"
+                echo "Msg : ${GIT_COMMIT_MSG}"
+                script {
+                    env.DOCKER_TAG = "${GIT_CRUUENT_BRANCH}-${env.BUILD_ID}-${GIT_COMMIT_ID}-${GIT_COMMIT_USER}"
+                }
+            }
+
+        }
+        stage("打包信息") {
+            steps {
+                // echo "服务名: ${ARTIFACT_ID}"
+                // echo "jar包版本: ${JAR_VERSION}"
+                echo "jar包完整路径: ${APP_TARGET}/${JAR_FILE}"
+                sh 'ls ${APP_TARGET}/${JAR_FILE}'
+                echo "${APP_TARGET}/${JAR_FILE} 已经存在"
+                echo "存储dockerfile的路径: ${dockerfileDir}"
+            }
+        }
+        stage("创建Docker build路径") {
+            steps {
+                sh "mkdir -p ${dockerfileDir}"
+                echo "未生效的docker tag : ${DOCKER_TAG}"
+            }
+        }
+        stage("移动jar包到docker build路径下") {
+            steps {
+                sh "mv ${APP_TARGET}/${JAR_FILE} ${dockerfileDir}"
+            }
+        }
+        // stage("构建镜像") {
+        //     steps {
+
+        //     }
+        // }
+        // stage("推送镜像") {
+        //     steps {
+
+        //     }
+        // }
+        // stage("部署k8s服务") {
+        //     steps {
+
+        //     }
+        // }
+    }
+    post{
+        always{
+            echo "========always========"
+        }
+        success{
+            echo "========pipeline executed successfully ========"
+        }
+        failure{
+            echo "========pipeline execution failed========"
+        }
+    }
+}

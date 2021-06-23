@@ -1,0 +1,100 @@
+def app
+def pom
+def dockerfilePath = "/var/jenkins_home/server-dockerfile"
+def jenkinsHome = "/data/jenkins_home/"
+def jenkinsWorkspace = "workspace/"
+
+pipeline {
+    agent any
+    parameters {
+        string(
+            name: 'SERVICE_NAME',
+            defaultValue: 'app-message',
+            description: '服务名'
+        )
+        string(
+            name: 'APP_TARGET',
+            defaultValue: 'server/target/',
+            description: '服务jar包所在位置'
+        )
+        choice(
+          description: '构建环境',
+          name: 'DEPLOY_ENV',
+          choices: ['dev', 'rc', 'canary','prod']
+        )
+        string(
+            name: 'GIT_URL',
+            defaultValue: 'ssh://git@xxx.xxxxx.cn:10022/xx-base-service/message-center.git',
+            description: 'git地址'
+        )
+        string(
+            name: 'DEPLOY_BRANCH',
+            defaultValue: 'master',
+            description: '部署的分支'
+        )
+        credentials(
+            name: 'GIT_TOKEN',
+            description: 'git拉取凭证',
+            defaultValue: 'gitlab',
+            credentialType: "SSH Username with private key",
+            required: true
+        )
+        string(
+            name: 'LATEST_VERSION',
+            defaultValue: 'latest',
+            description: '服务版本label'
+        )
+        booleanParam(
+            name: 'IS_DEPLOY',
+            defaultValue: true,
+            description: '是否部署'
+        )
+    }
+    environment {
+        //Use Pipeline Utility Steps plugin to read information from pom.xml into env variables
+        IMAGE = readMavenPom().getArtifactId()
+        VERSION = readMavenPom().getVersion()
+    }
+      stages {
+            stage('clone') {
+              steps {
+                echo "${TEST_NAME}"
+                git url: "${params.GIT_URL}",
+                  branch: "${params.DEPLOY_BRANCH}",
+                  credentialsId: "${params.GIT_TOKEN}"
+              }
+            }
+            stage('Build') {
+                steps([$class: 'BapSshPromotionPublisherPlugin']) {
+                            sshPublisher(
+                                continueOnError: false, failOnError: true,
+                                publishers: [
+                                    sshPublisherDesc(
+                                        configName:"syoo-jenkins",
+                                        verbose: true,
+                                        transfers: [
+                                            sshTransfer(execCommand:"source  /etc/profile && cd ${jenkinsHome}/${jenkinsWorkspace}/${env.JOB_NAME} && mvn clean package -DskipTests -U"),
+                                        ]
+                                    )
+                                ]
+                            )
+                        }
+            }
+            stage('Create Dockerfile'){
+                steps {
+                    sh '''
+                        cp -arv ../
+                    '''
+                }
+            }
+            stage('Deploy') {
+                steps {
+                    echo "Deploy stage: 部署机器的名称 : ${params.DEPLOY_ENV} ..."
+                    echo "Deploy stage: 部署连接的密码 : ${params.IS_DEPLOY} ..."
+                    echo "Deploy stage: Release Note的信息为 : ${params.IS_DEPLOY} ..."
+                }
+            }
+        }
+
+
+}
